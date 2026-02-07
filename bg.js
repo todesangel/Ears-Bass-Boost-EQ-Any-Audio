@@ -12,6 +12,8 @@ const DEFAULT_FILTERS = [
 ];
 
 const VALID_FILTER_TYPES = new Set(['peaking', 'lowshelf', 'highshelf']);
+const PRESETS_STORAGE_KEY = 'ears_presets_v1';
+const WORKSPACE_STORAGE_KEY = 'ears_workspace_state_v1';
 
 const workspace = {
   eqFilters: structuredClone(DEFAULT_FILTERS),
@@ -67,12 +69,16 @@ function normalizePresetValue(rawPreset) {
 }
 
 function normalizeImportedPresets(rawPresets) {
-  if (!rawPresets || typeof rawPresets !== 'object') {
+  const source = rawPresets?.presets && typeof rawPresets.presets === 'object'
+    ? rawPresets.presets
+    : rawPresets;
+
+  if (!source || typeof source !== 'object') {
     return {};
   }
 
   const normalized = {};
-  for (const [name, rawPreset] of Object.entries(rawPresets)) {
+  for (const [name, rawPreset] of Object.entries(source)) {
     if (!name || typeof name !== 'string') {
       continue;
     }
@@ -82,6 +88,70 @@ function normalizeImportedPresets(rawPresets) {
     }
   }
   return normalized;
+}
+
+function normalizeWorkspaceState(rawState) {
+  if (!rawState || typeof rawState !== 'object') {
+    return {
+      eqFilters: structuredClone(DEFAULT_FILTERS),
+      gain: 1
+    };
+  }
+
+  const rawFilters = Array.isArray(rawState.eqFilters)
+    ? rawState.eqFilters
+    : Array.isArray(rawState.filters)
+      ? rawState.filters
+      : null;
+
+  const eqFilters = DEFAULT_FILTERS.map((defaultFilter, index) => {
+    const rawFilter = rawFilters?.[index] || {};
+    return sanitizeFilter(rawFilter, defaultFilter);
+  });
+
+  return {
+    eqFilters,
+    gain: toFiniteNumber(rawState.gain, 1)
+  };
+}
+
+let initPromise = null;
+
+async function initWorkspace() {
+  if (initPromise) {
+    return initPromise;
+  }
+
+  initPromise = (async () => {
+    const stored = await chrome.storage.local.get([PRESETS_STORAGE_KEY, WORKSPACE_STORAGE_KEY]);
+    workspace.presets = normalizeImportedPresets(stored[PRESETS_STORAGE_KEY]);
+
+    const persistedState = normalizeWorkspaceState(stored[WORKSPACE_STORAGE_KEY]);
+    workspace.eqFilters = persistedState.eqFilters;
+    workspace.gain = persistedState.gain;
+  })().catch((error) => {
+    console.error('Unable to load workspace from storage:', error);
+    workspace.presets = {};
+    workspace.eqFilters = structuredClone(DEFAULT_FILTERS);
+    workspace.gain = 1;
+  });
+
+  return initPromise;
+}
+
+async function persistPresets() {
+  await chrome.storage.local.set({
+    [PRESETS_STORAGE_KEY]: workspace.presets
+  });
+}
+
+async function persistWorkspaceState() {
+  await chrome.storage.local.set({
+    [WORKSPACE_STORAGE_KEY]: {
+      eqFilters: workspace.eqFilters,
+      gain: workspace.gain
+    }
+  });
 }
 
 function cloneWorkspaceState() {
@@ -216,10 +286,14 @@ chrome.runtime.onInstalled.addListener(() => {
   console.log('Ears installed/updated', chrome.runtime.getManifest().version);
 });
 
+void initWorkspace();
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const senderTabId = sender?.tab?.id;
 
   (async () => {
+    await initWorkspace();
+
     switch (message?.type) {
       case 'PING':
         sendResponse({ reply: 'PONG' });
@@ -262,6 +336,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             q: message.q
           };
           await syncProcessingNodes();
+          await persistWorkspaceState();
           pushWorkspaceUpdates();
         }
         return;
@@ -272,6 +347,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             gain: 0
           };
           await syncProcessingNodes();
+          await persistWorkspaceState();
           pushWorkspaceUpdates();
         }
         return;
@@ -279,6 +355,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'gainUpdated':
         workspace.gain = message.gain;
         await syncProcessingNodes();
+        await persistWorkspaceState();
         pushWorkspaceUpdates();
         return;
       case 'filterUpdated':
@@ -288,11 +365,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'resetFilters':
         workspace.eqFilters = workspace.eqFilters.map((filter) => ({ ...filter, gain: 0 }));
         await syncProcessingNodes();
+        await persistWorkspaceState();
         pushWorkspaceUpdates();
         return;
       case 'preset':
         applyPreset(message.preset);
         await syncProcessingNodes();
+        await persistWorkspaceState();
         pushWorkspaceUpdates();
         return;
       case 'savePreset':
@@ -300,10 +379,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           eqFilters: workspace.eqFilters.map((filter) => ({ ...filter })),
           gain: workspace.gain
         };
+        await persistPresets();
         chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
         return;
       case 'deletePreset':
         delete workspace.presets[message.preset];
+        await persistPresets();
         chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
         return;
       case 'exportPresets': {
@@ -319,6 +400,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'importPresets': {
         const imported = normalizeImportedPresets(message.presets);
         workspace.presets = { ...workspace.presets, ...imported };
+        await persistPresets();
         chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
         return;
       }
