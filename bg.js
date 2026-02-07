@@ -1,4 +1,5 @@
 const OFFSCREEN_PATH = 'offscreen.html';
+const PRESETS_STORAGE_KEY = 'presets';
 const DEFAULT_FILTERS = [
   { type: 'lowshelf', frequency: 60, q: 0.7, gain: 0 },
   { type: 'peaking', frequency: 170, q: 1, gain: 0 },
@@ -18,6 +19,8 @@ const workspace = {
   streams: [],
   presets: {}
 };
+
+let workspaceBootstrapPromise;
 
 function cloneWorkspaceState() {
   return {
@@ -52,6 +55,58 @@ async function ensureOffscreenDocument() {
 async function sendToOffscreen(message) {
   await ensureOffscreenDocument();
   return chrome.runtime.sendMessage({ target: 'offscreen', ...message });
+}
+
+async function hydratePresets() {
+  const stored = await chrome.storage.local.get(PRESETS_STORAGE_KEY);
+  const presets = stored?.[PRESETS_STORAGE_KEY];
+  workspace.presets = presets && typeof presets === 'object' ? presets : {};
+}
+
+async function persistPresets() {
+  await chrome.storage.local.set({ [PRESETS_STORAGE_KEY]: workspace.presets });
+}
+
+async function hydrateActiveStreams() {
+  const response = await sendToOffscreen({ command: 'getActiveTabSessions' });
+  const sessions = Array.isArray(response?.sessions) ? response.sessions : [];
+  const streams = [];
+
+  for (const session of sessions) {
+    if (!Number.isInteger(session?.tabId)) {
+      continue;
+    }
+
+    try {
+      const tab = await chrome.tabs.get(session.tabId);
+      streams.push({
+        id: tab.id,
+        title: tab.title || `Tab ${tab.id}`,
+        favIconUrl: tab.favIconUrl || ''
+      });
+      if (session.sampleRate) {
+        workspace.sampleRate = session.sampleRate;
+      }
+    } catch {
+      await sendToOffscreen({ command: 'stopTabAudio', tabId: session.tabId });
+    }
+  }
+
+  workspace.streams = streams;
+}
+
+async function ensureWorkspaceHydrated() {
+  if (!workspaceBootstrapPromise) {
+    workspaceBootstrapPromise = (async () => {
+      await hydratePresets();
+      await hydrateActiveStreams();
+    })().catch((error) => {
+      workspaceBootstrapPromise = undefined;
+      throw error;
+    });
+  }
+
+  return workspaceBootstrapPromise;
 }
 
 async function getActiveTabId(fallbackSenderTabId) {
@@ -138,6 +193,7 @@ async function syncProcessingNodes() {
 }
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  await ensureWorkspaceHydrated();
   if (!findStream(tabId)) {
     return;
   }
@@ -149,19 +205,27 @@ chrome.runtime.onInstalled.addListener(() => {
   console.log('Ears installed/updated', chrome.runtime.getManifest().version);
 });
 
+ensureWorkspaceHydrated().catch((error) => {
+  console.error('Failed to initialize Ears workspace:', error);
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const senderTabId = sender?.tab?.id;
 
   (async () => {
+    await ensureWorkspaceHydrated();
+
     switch (message?.type) {
       case 'PING':
         sendResponse({ reply: 'PONG' });
         return;
       case 'onPopupOpen':
       case 'getFullRefresh':
+        await hydrateActiveStreams();
         pushWorkspaceUpdates();
         return;
       case 'eqTab': {
+        await hydrateActiveStreams();
         const tabId = await getActiveTabId(senderTabId);
         if (!tabId) {
           return;
@@ -233,10 +297,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           eqFilters: workspace.eqFilters.map((filter) => ({ ...filter })),
           gain: workspace.gain
         };
+        await persistPresets();
         chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
         return;
       case 'deletePreset':
         delete workspace.presets[message.preset];
+        await persistPresets();
         chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
         return;
       case 'exportPresets': {
@@ -251,9 +317,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       case 'importPresets':
         workspace.presets = { ...workspace.presets, ...message.presets };
+        await persistPresets();
         chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
         return;
       case 'getFFT': {
+        await hydrateActiveStreams();
         const tabId = await getActiveTabId(senderTabId);
         if (!tabId || !findStream(tabId)) {
           sendResponse({ fft: [] });

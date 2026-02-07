@@ -94,6 +94,15 @@ function updateAllFilters(filters, gain) {
   }
 }
 
+
+function getActiveTabSessions() {
+  const sessions = [];
+  for (const [tabId, session] of tabAudio.entries()) {
+    sessions.push({ tabId, sampleRate: session.context.sampleRate });
+  }
+  return { sessions };
+}
+
 function getFFT(tabId) {
   const session = tabAudio.get(tabId);
   if (!session) {
@@ -125,6 +134,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return;
       case 'getFFT':
         sendResponse(getFFT(message.tabId));
+        return;
+      case 'getActiveTabSessions':
+        sendResponse(getActiveTabSessions());
         return;
       default:
         sendResponse({ ok: false });
