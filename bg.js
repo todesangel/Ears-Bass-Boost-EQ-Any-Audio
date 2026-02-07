@@ -12,6 +12,7 @@ const DEFAULT_FILTERS = [
 ];
 
 const VALID_FILTER_TYPES = new Set(['peaking', 'lowshelf', 'highshelf']);
+const PRESETS_STORAGE_KEY = 'ears_presets_v1';
 
 const workspace = {
   eqFilters: structuredClone(DEFAULT_FILTERS),
@@ -67,12 +68,16 @@ function normalizePresetValue(rawPreset) {
 }
 
 function normalizeImportedPresets(rawPresets) {
-  if (!rawPresets || typeof rawPresets !== 'object') {
+  const source = rawPresets?.presets && typeof rawPresets.presets === 'object'
+    ? rawPresets.presets
+    : rawPresets;
+
+  if (!source || typeof source !== 'object') {
     return {};
   }
 
   const normalized = {};
-  for (const [name, rawPreset] of Object.entries(rawPresets)) {
+  for (const [name, rawPreset] of Object.entries(source)) {
     if (!name || typeof name !== 'string') {
       continue;
     }
@@ -82,6 +87,30 @@ function normalizeImportedPresets(rawPresets) {
     }
   }
   return normalized;
+}
+
+let initPromise = null;
+
+async function initWorkspace() {
+  if (initPromise) {
+    return initPromise;
+  }
+
+  initPromise = (async () => {
+    const stored = await chrome.storage.local.get(PRESETS_STORAGE_KEY);
+    workspace.presets = normalizeImportedPresets(stored[PRESETS_STORAGE_KEY]);
+  })().catch((error) => {
+    console.error('Unable to load presets from storage:', error);
+    workspace.presets = {};
+  });
+
+  return initPromise;
+}
+
+async function persistPresets() {
+  await chrome.storage.local.set({
+    [PRESETS_STORAGE_KEY]: workspace.presets
+  });
 }
 
 function cloneWorkspaceState() {
@@ -216,10 +245,14 @@ chrome.runtime.onInstalled.addListener(() => {
   console.log('Ears installed/updated', chrome.runtime.getManifest().version);
 });
 
+void initWorkspace();
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const senderTabId = sender?.tab?.id;
 
   (async () => {
+    await initWorkspace();
+
     switch (message?.type) {
       case 'PING':
         sendResponse({ reply: 'PONG' });
@@ -300,10 +333,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           eqFilters: workspace.eqFilters.map((filter) => ({ ...filter })),
           gain: workspace.gain
         };
+        await persistPresets();
         chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
         return;
       case 'deletePreset':
         delete workspace.presets[message.preset];
+        await persistPresets();
         chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
         return;
       case 'exportPresets': {
@@ -319,6 +354,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case 'importPresets': {
         const imported = normalizeImportedPresets(message.presets);
         workspace.presets = { ...workspace.presets, ...imported };
+        await persistPresets();
         chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
         return;
       }
