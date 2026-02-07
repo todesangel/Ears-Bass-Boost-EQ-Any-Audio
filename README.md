@@ -1,73 +1,74 @@
-# 🎧 Ears: Bass Boost & EQ
+# 🎧 Ears: Bass Boost, EQ Any Audio! (Chrome Extension)
 
-**Turn up the bass and take control of your audio!** Ears is a powerful, intuitive, and lightweight audio equalizer that lets you boost the bass, fine-tune frequencies, and customize the sound of any audio playing on your device.
+`Ears` — это расширение для Chrome (Manifest V3), которое позволяет эквализировать звук **в любых вкладках** браузера в реальном времени: усиливать бас, приглушать высокие, поднимать вокал и сохранять собственные пресеты.
 
-[![GitHub release](https://img.shields.io/github/v/release/yourusername/ears-bass-boost-eq)](https://github.com/yourusername/ears-bass-boost-eq/releases)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-android-lightgrey)
+## Что изменилось в этом README
 
----
+Старое описание было про Android/APK, а этот репозиторий содержит именно **Chrome extension**. README обновлён под актуальный формат проекта и реальные файлы в репозитории.
 
-### 🚀 Features
+## ✨ Возможности
 
-*   **💥 Powerful Bass Boost:** Instantly enhance the low-end frequencies for a deeper, more powerful sound. Feel the music in your bones!
-*   **🎛️ 10-Band Graphic Equalizer:** Precisely control your audio with a professional 10-band EQ. Adjust frequencies from 32Hz to 16kHz.
-*   **🚀 Virtualizer:** Widen the stereo field and create an immersive, 3D-like audio experience.
-*   **🔄 Preset EQ Modes:** One-tap optimization for different genres and activities (e.g., Rock, Pop, Classical, Bass Booster, Treble Booster).
-*   **💾 Save Custom Presets:** Create and save your own perfect EQ settings for different songs, artists, or headphones.
-*   **🌙 Modern & Dark UI:** A sleek, user-friendly interface designed for easy use in any lighting.
+- Параметрический эквалайзер с интерактивными точками фильтров.
+- Быстрый пресет **Bass Boost**.
+- Сохранение, удаление, импорт и экспорт пользовательских пресетов.
+- Спектральный визуализатор.
+- Поддержка работы с несколькими активными вкладками.
+- Кнопка запуска в отдельном окне (Full Window).
 
-### 📥 Download
+## 📦 Установка (локально, для разработки)
 
-Get the latest version of Ears from the [Releases Page](https://github.com/yourusername/ears-bass-boost-eq/releases).
+1. Скачайте/клонируйте репозиторий.
+2. Откройте `chrome://extensions`.
+3. Включите **Developer mode**.
+4. Нажмите **Load unpacked**.
+5. Выберите папку этого проекта.
 
-[<img src="https://img.shields.io/badge/GitHub-Download%20APK-blue?logo=github&style=for-the-badge" alt="Download APK from GitHub" height="60">](https://github.com/yourusername/ears-bass-boost-eq/releases/latest)
+После установки нажмите на иконку `Ears` в панели расширений, чтобы подключить текущую вкладку к эквалайзеру.
 
-### 🖼️ Screenshots
+## 🧭 Как пользоваться
 
-| Main EQ Interface | Bass Boost Slider | Preset Selection |
-| :---: | :---: | :---: |
-| <img src="screenshots/main_ui.png" width="250"> | <img src="screenshots/bass_boost.png" width="250"> | <img src="screenshots/presets.png" width="250"> |
+1. Откройте вкладку с аудио/видео.
+2. Нажмите на иконку расширения `Ears`.
+3. Вкладка будет добавлена в активные для обработки звука.
+4. Настройте фильтры на вкладке **Controls**.
+5. При необходимости сохраните пресет (кнопка **+ Save Preset**).
+6. Для переноса настроек используйте **Export Presets** / **Import Presets**.
 
-### 🛠️ How to Use
+## 🏗️ Структура проекта
 
-1.  **Download and install** the APK from the link above.
-2.  **Open the Ears** app.
-3.  **Grant the necessary audio permissions** when prompted.
-4.  **Start playing music** in your favorite music app (Spotify, YouTube, local player, etc.).
-5.  **Switch back to Ears** and use the sliders to boost the bass, adjust the EQ, or select a preset.
-6.  **Enjoy your newly supercharged audio!**
+- `manifest.json` — конфигурация расширения (MV3, permissions, background worker).
+- `popup.html`, `popup.css`, `popup.js` — UI/логика всплывающего окна и контролов EQ.
+- `bg.js` — background service worker.
+- `offscreen.html`, `offscreen.js` — offscreen-документ для обработки аудиопотока.
+- `snap.svg-min.js` — библиотека для работы с SVG в UI.
+- `ears*.png`, `earstile*.*` — иконки и графические ассеты.
 
-### 🏗️ Building from Source
+## 🔐 Разрешения
 
-If you're a developer and want to build the project yourself, follow these steps:
+Расширение использует следующие группы разрешений (см. `manifest.json`):
 
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/yourusername/ears-bass-boost-eq.git
-    ```
-2.  Open the project in **Android Studio** (Arctic Fox or newer recommended).
-3.  Let Gradle sync and download the dependencies.
-4.  Build and run the project on your device or emulator.
+- `tabCapture`, `tabs`, `activeTab` — для захвата и обработки аудио активных вкладок.
+- `storage` — для сохранения пользовательских пресетов и настроек.
+- `scripting`, `offscreen`, `downloads` — для служебной логики расширения, offscreen-обработки и экспорта пресетов.
+- `host_permissions: <all_urls>` — доступ к вкладкам с любыми адресами для применения EQ к аудио.
 
-### 🤝 Contributing
+## 🧪 Разработка и проверка
 
-Contributions are what make the open-source community such an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**.
+Проект не требует сборки: это unpacked extension с готовыми статическими файлами.
 
-1.  Fork the Project
-2.  Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3.  Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4.  Push to the Branch (`git push origin feature/AmazingFeature`)
-5.  Open a Pull Request
+Быстрые проверки после изменений:
 
-### 📜 License
+```bash
+python -m json.tool manifest.json >/dev/null
+node --check bg.js
+node --check popup.js
+node --check offscreen.js
+```
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+## 🌐 Публикация
 
-### ⚠️ Disclaimer
+Страница расширения в Chrome Web Store указана внутри интерфейса (`popup.html`).
 
-This app requires audio permissions to process system-wide audio. It does not collect, store, or transmit any personal data. The app is provided "as is" without any warranty. Use at your own risk.
+## ⚠️ Disclaimer
 
----
-
-**Made with ❤️ and the power of low frequencies.**
+Сильное усиление частот может повредить слух и/или акустику. Используйте эквалайзер ответственно.
