@@ -1,4 +1,11 @@
-const OFFSCREEN_PATH = 'offscreen.html';
+// Ears background event page (Firefox MV3).
+//
+// The audio graph itself lives in eq-content.js, injected into each tab the
+// user equalizes. This script owns the shared filter/gain state, the preset
+// store, and the message routing between the popup and those content scripts.
+
+const CONTENT_SCRIPT = 'eq-content.js';
+
 const DEFAULT_FILTERS = [
   { type: 'lowshelf', frequency: 60, q: 0.7, gain: 0 },
   { type: 'peaking', frequency: 170, q: 1, gain: 0 },
@@ -13,12 +20,14 @@ const DEFAULT_FILTERS = [
 
 const VALID_FILTER_TYPES = new Set(['peaking', 'lowshelf', 'highshelf']);
 const PRESETS_STORAGE_KEY = 'ears_presets_v1';
+const SESSION_STATE_KEY = 'ears_session_v1';
 
 const workspace = {
   eqFilters: structuredClone(DEFAULT_FILTERS),
   gain: 1,
   sampleRate: 44100,
   streams: [],
+  frames: {},
   presets: {}
 };
 
@@ -89,6 +98,11 @@ function normalizeImportedPresets(rawPresets) {
   return normalized;
 }
 
+// --- persistence -------------------------------------------------------
+// The event page is suspended when idle, which would otherwise wipe the live
+// EQ settings and the list of equalized tabs. Presets go to local storage;
+// the volatile runtime state goes to session storage.
+
 let initPromise = null;
 
 async function initWorkspace() {
@@ -97,10 +111,21 @@ async function initWorkspace() {
   }
 
   initPromise = (async () => {
-    const stored = await chrome.storage.local.get(PRESETS_STORAGE_KEY);
+    const stored = await browser.storage.local.get(PRESETS_STORAGE_KEY);
     workspace.presets = normalizeImportedPresets(stored[PRESETS_STORAGE_KEY]);
+
+    const session = await browser.storage.session.get(SESSION_STATE_KEY);
+    const saved = session[SESSION_STATE_KEY];
+    if (saved) {
+      workspace.eqFilters = DEFAULT_FILTERS.map((defaultFilter, index) =>
+        sanitizeFilter(saved.eqFilters?.[index], defaultFilter));
+      workspace.gain = toFiniteNumber(saved.gain, 1);
+      workspace.sampleRate = toFiniteNumber(saved.sampleRate, 44100);
+      workspace.streams = Array.isArray(saved.streams) ? saved.streams : [];
+      workspace.frames = saved.frames && typeof saved.frames === 'object' ? saved.frames : {};
+    }
   })().catch((error) => {
-    console.error('Unable to load presets from storage:', error);
+    console.error('Unable to restore Ears state:', error);
     workspace.presets = {};
   });
 
@@ -108,9 +133,30 @@ async function initWorkspace() {
 }
 
 async function persistPresets() {
-  await chrome.storage.local.set({
+  await browser.storage.local.set({
     [PRESETS_STORAGE_KEY]: workspace.presets
   });
+}
+
+function persistSession() {
+  browser.storage.session
+    .set({
+      [SESSION_STATE_KEY]: {
+        eqFilters: workspace.eqFilters,
+        gain: workspace.gain,
+        sampleRate: workspace.sampleRate,
+        streams: workspace.streams,
+        frames: workspace.frames
+      }
+    })
+    .catch(() => {});
+}
+
+// --- messaging --------------------------------------------------------------
+
+// Nothing is listening whenever the popup is closed, which is the normal case.
+function broadcast(message) {
+  browser.runtime.sendMessage(message).catch(() => {});
 }
 
 function cloneWorkspaceState() {
@@ -125,27 +171,10 @@ function cloneWorkspaceState() {
   };
 }
 
-async function ensureOffscreenDocument() {
-  const url = chrome.runtime.getURL(OFFSCREEN_PATH);
-  const contexts = await chrome.runtime.getContexts({
-    contextTypes: ['OFFSCREEN_DOCUMENT'],
-    documentUrls: [url]
-  });
-
-  if (contexts.length > 0) {
-    return;
-  }
-
-  await chrome.offscreen.createDocument({
-    url: OFFSCREEN_PATH,
-    reasons: ['AUDIO_PLAYBACK'],
-    justification: 'Equalize captured tab audio and return FFT data for visualizer.'
-  });
-}
-
-async function sendToOffscreen(message) {
-  await ensureOffscreenDocument();
-  return chrome.runtime.sendMessage({ target: 'offscreen', ...message });
+function pushWorkspaceUpdates() {
+  broadcast({ type: 'sendWorkspaceStatus', ...cloneWorkspaceState() });
+  broadcast({ type: 'sendPresets', presets: workspace.presets });
+  broadcast({ type: 'sendSampleRate', Fs: workspace.sampleRate });
 }
 
 async function getActiveTabId(fallbackSenderTabId) {
@@ -153,50 +182,93 @@ async function getActiveTabId(fallbackSenderTabId) {
     return fallbackSenderTabId;
   }
 
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tabs[0]?.id) {
-    return tabs[0].id;
-  }
-  return null;
-}
-
-function pushWorkspaceUpdates() {
-  chrome.runtime.sendMessage({ type: 'sendWorkspaceStatus', ...cloneWorkspaceState() });
-  chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
-  chrome.runtime.sendMessage({ type: 'sendSampleRate', Fs: workspace.sampleRate });
+  const tabs = await browser.tabs.query({ active: true, currentWindow: true });
+  return tabs[0]?.id ?? null;
 }
 
 function findStream(tabId) {
   return workspace.streams.find((stream) => stream.id === tabId);
 }
 
-async function startEqForTab(tabId) {
-  if (findStream(tabId)) {
-    return;
+async function injectContentScript(tabId) {
+  const results = await browser.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    files: [CONTENT_SCRIPT]
+  });
+
+  return results
+    .map((result) => result.frameId)
+    .filter((frameId) => Number.isInteger(frameId));
+}
+
+// A frame can disappear mid-flight, so per-frame failures are not fatal.
+async function sendToFrames(tabId, frameIds, message) {
+  const payload = { target: 'ears-content', ...message };
+  const responses = [];
+
+  for (const frameId of frameIds) {
+    try {
+      responses.push(await browser.tabs.sendMessage(tabId, payload, { frameId }));
+    } catch (error) {
+      responses.push(null);
+    }
   }
 
-  const tab = await chrome.tabs.get(tabId);
-  const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+  return responses;
+}
 
-  const response = await sendToOffscreen({
-    command: 'startTabAudio',
-    tabId,
-    streamId,
+function framesFor(tabId) {
+  const frameIds = workspace.frames[tabId];
+  return Array.isArray(frameIds) && frameIds.length ? frameIds : [0];
+}
+
+async function startEqForTab(tabId) {
+  const tab = await browser.tabs.get(tabId);
+
+  let frameIds;
+  try {
+    frameIds = await injectContentScript(tabId);
+  } catch (error) {
+    // about:, view-source:, addons.mozilla.org and friends refuse injection.
+    return { ok: false, reason: 'restricted-page' };
+  }
+
+  if (!frameIds.length) {
+    return { ok: false, reason: 'restricted-page' };
+  }
+
+  const responses = await sendToFrames(tabId, frameIds, {
+    command: 'enable',
     filters: workspace.eqFilters,
     gain: workspace.gain
   });
 
-  workspace.sampleRate = response?.sampleRate || workspace.sampleRate;
-  workspace.streams.push({
-    id: tab.id,
-    title: tab.title || `Tab ${tab.id}`,
-    favIconUrl: tab.favIconUrl || ''
-  });
+  const live = responses.filter((response) => response?.ok);
+  if (!live.length) {
+    return { ok: false, reason: 'audio-unavailable' };
+  }
+
+  const withMedia = live.find((response) => response.mediaCount > 0);
+  workspace.sampleRate = (withMedia || live[0]).sampleRate || workspace.sampleRate;
+  workspace.frames[tabId] = frameIds;
+
+  if (!findStream(tabId)) {
+    workspace.streams.push({
+      id: tab.id,
+      title: tab.title || `Tab ${tab.id}`,
+      favIconUrl: tab.favIconUrl || ''
+    });
+  }
+  persistSession();
+
+  return { ok: true, reason: withMedia ? withMedia.reason || null : 'no-media' };
 }
 
 async function stopEqForTab(tabId) {
-  await sendToOffscreen({ command: 'stopTabAudio', tabId });
+  await sendToFrames(tabId, framesFor(tabId), { command: 'disable' });
+  delete workspace.frames[tabId];
   workspace.streams = workspace.streams.filter((stream) => stream.id !== tabId);
+  persistSession();
 }
 
 function applyPreset(name) {
@@ -226,158 +298,241 @@ function applyPreset(name) {
 }
 
 async function syncProcessingNodes() {
-  await sendToOffscreen({
-    command: 'updateAllFilters',
-    filters: workspace.eqFilters,
-    gain: workspace.gain
-  });
+  persistSession();
+
+  await Promise.all(
+    workspace.streams.map((stream) =>
+      sendToFrames(stream.id, framesFor(stream.id), {
+        command: 'updateFilters',
+        filters: workspace.eqFilters,
+        gain: workspace.gain
+      })
+    )
+  );
 }
 
-chrome.tabs.onRemoved.addListener(async (tabId) => {
+async function handleGetFFT(senderTabId) {
+  await initWorkspace();
+
+  const tabId = await getActiveTabId(senderTabId);
+  if (!tabId || !findStream(tabId)) {
+    return { fft: [] };
+  }
+
+  for (const frameId of framesFor(tabId)) {
+    const response = await sendToFrames(tabId, [frameId], { command: 'getFFT' });
+    if (response[0]?.fft?.length) {
+      return response[0];
+    }
+  }
+
+  return { fft: [] };
+}
+
+// --- lifecycle ---------------------------------------------------------
+
+browser.tabs.onRemoved.addListener(async (tabId) => {
+  await initWorkspace();
   if (!findStream(tabId)) {
     return;
   }
-  await stopEqForTab(tabId);
+  // The tab is gone, so there is nothing left to tell the content script.
+  delete workspace.frames[tabId];
+  workspace.streams = workspace.streams.filter((stream) => stream.id !== tabId);
+  persistSession();
   pushWorkspaceUpdates();
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  console.log('Ears installed/updated', chrome.runtime.getManifest().version);
+// Navigating destroys the content script, so re-inject and re-apply.
+browser.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (changeInfo.status !== 'complete') {
+    return;
+  }
+
+  await initWorkspace();
+  const stream = findStream(tabId);
+  if (!stream) {
+    return;
+  }
+
+  try {
+    const frameIds = await injectContentScript(tabId);
+    workspace.frames[tabId] = frameIds;
+    await sendToFrames(tabId, frameIds, {
+      command: 'enable',
+      filters: workspace.eqFilters,
+      gain: workspace.gain
+    });
+
+    const tab = await browser.tabs.get(tabId);
+    stream.title = tab.title || stream.title;
+    stream.favIconUrl = tab.favIconUrl || '';
+  } catch (error) {
+    // Without a granted host permission, activeTab does not survive a
+    // navigation. Drop the tab rather than pretending it is still equalized.
+    delete workspace.frames[tabId];
+    workspace.streams = workspace.streams.filter((entry) => entry.id !== tabId);
+    broadcast({ type: 'sendEqNotice', reason: 'reattach-failed' });
+  }
+
+  persistSession();
+  pushWorkspaceUpdates();
+});
+
+browser.runtime.onInstalled.addListener(() => {
+  console.log('Ears installed/updated', browser.runtime.getManifest().version);
 });
 
 void initWorkspace();
 
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+async function handleCommand(message, senderTabId) {
+  await initWorkspace();
+
+  switch (message?.type) {
+    case 'onPopupOpen':
+    case 'getFullRefresh':
+      pushWorkspaceUpdates();
+      return;
+
+    case 'eqTab': {
+      const tabId = await getActiveTabId(senderTabId);
+      if (!tabId) {
+        return;
+      }
+
+      if (message.on) {
+        const result = await startEqForTab(tabId);
+        // Opening the popup attaches automatically, so staying quiet about a
+        // page that simply has no media yet keeps the notice meaningful.
+        const quiet = message.auto && result.reason === 'no-media';
+        if (result.reason && !quiet) {
+          broadcast({ type: 'sendEqNotice', reason: result.reason });
+        }
+      } else {
+        await stopEqForTab(tabId);
+      }
+
+      broadcast({
+        type: 'sendCurrentTabStatus',
+        streaming: Boolean(findStream(tabId))
+      });
+      pushWorkspaceUpdates();
+      return;
+    }
+
+    case 'disconnectTab':
+      if (message.tab?.id) {
+        await stopEqForTab(message.tab.id);
+        pushWorkspaceUpdates();
+      }
+      return;
+
+    case 'modifyFilter':
+      if (workspace.eqFilters[message.index]) {
+        workspace.eqFilters[message.index] = {
+          ...workspace.eqFilters[message.index],
+          frequency: message.frequency,
+          gain: message.gain,
+          q: message.q
+        };
+        await syncProcessingNodes();
+        pushWorkspaceUpdates();
+      }
+      return;
+
+    case 'resetFilter':
+      if (workspace.eqFilters[message.index]) {
+        workspace.eqFilters[message.index] = {
+          ...workspace.eqFilters[message.index],
+          gain: 0
+        };
+        await syncProcessingNodes();
+        pushWorkspaceUpdates();
+      }
+      return;
+
+    case 'modifyGain':
+    case 'gainUpdated':
+      workspace.gain = toFiniteNumber(message.gain, workspace.gain);
+      await syncProcessingNodes();
+      pushWorkspaceUpdates();
+      return;
+
+    case 'filterUpdated':
+      await syncProcessingNodes();
+      pushWorkspaceUpdates();
+      return;
+
+    case 'resetFilters':
+      workspace.eqFilters = workspace.eqFilters.map((filter) => ({ ...filter, gain: 0 }));
+      await syncProcessingNodes();
+      pushWorkspaceUpdates();
+      return;
+
+    case 'preset':
+      applyPreset(message.preset);
+      await syncProcessingNodes();
+      pushWorkspaceUpdates();
+      return;
+
+    case 'savePreset':
+      workspace.presets[message.preset] = {
+        eqFilters: workspace.eqFilters.map((filter) => ({ ...filter })),
+        gain: workspace.gain
+      };
+      await persistPresets();
+      broadcast({ type: 'sendPresets', presets: workspace.presets });
+      return;
+
+    case 'deletePreset':
+      delete workspace.presets[message.preset];
+      await persistPresets();
+      broadcast({ type: 'sendPresets', presets: workspace.presets });
+      return;
+
+    case 'exportPresets': {
+      const payload = JSON.stringify(workspace.presets, null, 2);
+      const url = `data:application/json;charset=utf-8,${encodeURIComponent(payload)}`;
+      await browser.downloads.download({
+        url,
+        filename: 'ears-presets.json',
+        saveAs: true
+      });
+      return;
+    }
+
+    case 'importPresets': {
+      const imported = normalizeImportedPresets(message.presets);
+      workspace.presets = { ...workspace.presets, ...imported };
+      await persistPresets();
+      broadcast({ type: 'sendPresets', presets: workspace.presets });
+      return;
+    }
+
+    default:
+  }
+}
+
+// Firefox resolves the sender's promise with whatever a listener returns, so
+// return a promise only for the messages that actually expect a reply.
+browser.runtime.onMessage.addListener((message, sender) => {
   const senderTabId = sender?.tab?.id;
 
-  (async () => {
-    await initWorkspace();
+  switch (message?.type) {
+    case 'PING':
+      return Promise.resolve({ reply: 'PONG' });
 
-    switch (message?.type) {
-      case 'PING':
-        sendResponse({ reply: 'PONG' });
-        return;
-      case 'onPopupOpen':
-      case 'getFullRefresh':
-        pushWorkspaceUpdates();
-        return;
-      case 'eqTab': {
-        const tabId = await getActiveTabId(senderTabId);
-        if (!tabId) {
-          return;
-        }
+    case 'getFFT':
+      return handleGetFFT(senderTabId).catch(() => ({ fft: [] }));
 
-        if (message.on) {
-          await startEqForTab(tabId);
-        } else {
-          await stopEqForTab(tabId);
-        }
+    case 'earsNotice':
+      broadcast({ type: 'sendEqNotice', reason: message.reason });
+      return false;
 
-        chrome.runtime.sendMessage({
-          type: 'sendCurrentTabStatus',
-          streaming: Boolean(findStream(tabId))
-        });
-        pushWorkspaceUpdates();
-        return;
-      }
-      case 'disconnectTab':
-        if (message.tab?.id) {
-          await stopEqForTab(message.tab.id);
-          pushWorkspaceUpdates();
-        }
-        return;
-      case 'modifyFilter':
-        if (workspace.eqFilters[message.index]) {
-          workspace.eqFilters[message.index] = {
-            ...workspace.eqFilters[message.index],
-            frequency: message.frequency,
-            gain: message.gain,
-            q: message.q
-          };
-          await syncProcessingNodes();
-          pushWorkspaceUpdates();
-        }
-        return;
-      case 'resetFilter':
-        if (workspace.eqFilters[message.index]) {
-          workspace.eqFilters[message.index] = {
-            ...workspace.eqFilters[message.index],
-            gain: 0
-          };
-          await syncProcessingNodes();
-          pushWorkspaceUpdates();
-        }
-        return;
-      case 'modifyGain':
-      case 'gainUpdated':
-        workspace.gain = message.gain;
-        await syncProcessingNodes();
-        pushWorkspaceUpdates();
-        return;
-      case 'filterUpdated':
-        await syncProcessingNodes();
-        pushWorkspaceUpdates();
-        return;
-      case 'resetFilters':
-        workspace.eqFilters = workspace.eqFilters.map((filter) => ({ ...filter, gain: 0 }));
-        await syncProcessingNodes();
-        pushWorkspaceUpdates();
-        return;
-      case 'preset':
-        applyPreset(message.preset);
-        await syncProcessingNodes();
-        pushWorkspaceUpdates();
-        return;
-      case 'savePreset':
-        workspace.presets[message.preset] = {
-          eqFilters: workspace.eqFilters.map((filter) => ({ ...filter })),
-          gain: workspace.gain
-        };
-        await persistPresets();
-        chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
-        return;
-      case 'deletePreset':
-        delete workspace.presets[message.preset];
-        await persistPresets();
-        chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
-        return;
-      case 'exportPresets': {
-        const payload = JSON.stringify(workspace.presets, null, 2);
-        const url = `data:application/json;charset=utf-8,${encodeURIComponent(payload)}`;
-        await chrome.downloads.download({
-          url,
-          filename: 'ears-presets.json',
-          saveAs: true
-        });
-        return;
-      }
-      case 'importPresets': {
-        const imported = normalizeImportedPresets(message.presets);
-        workspace.presets = { ...workspace.presets, ...imported };
-        await persistPresets();
-        chrome.runtime.sendMessage({ type: 'sendPresets', presets: workspace.presets });
-        return;
-      }
-      case 'getFFT': {
-        const tabId = await getActiveTabId(senderTabId);
-        if (!tabId || !findStream(tabId)) {
-          sendResponse({ fft: [] });
-          return;
-        }
-
-        const response = await sendToOffscreen({ command: 'getFFT', tabId });
-        sendResponse(response || { fft: [] });
-        return;
-      }
-      default:
-        return;
-    }
-  })().catch((error) => {
-    console.error('Ears background error:', error);
-    if (message?.type === 'getFFT') {
-      sendResponse({ fft: [] });
-    }
-  });
-
-  return true;
+    default:
+      handleCommand(message, senderTabId).catch((error) => {
+        console.error('Ears background error:', error);
+      });
+      return false;
+  }
 });

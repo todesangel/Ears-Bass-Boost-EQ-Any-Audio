@@ -176,12 +176,8 @@ html {
     min-height : 500px;
 }
 
-h1,h2,h3,#pl,#lt {
+h1,h2,h3 {
     color : wheat;
-}
-
-#lt {
-    line-height : 1.5;
 }
 
 #pl {
@@ -306,7 +302,7 @@ button :focus {
     border-style : solid;
 }
 
-#requiresProDiv {
+#noticeDiv {
 	position: absolute;
 	top: 102px;
     left: 100px;
@@ -328,6 +324,6 @@ button :focus {
 	transition: all linear 0.2s;
 }
 
-#requiresProDiv.show {
+#noticeDiv.show {
 	opacity: 1;
 }
